@@ -112,6 +112,24 @@ function rms(frame: Int16Array): number {
 	return Math.sqrt(sum / frame.length);
 }
 
+// Legacy terminals send Option/Alt+key as ESC + the character of the active layout, so on a
+// Russian or Ukrainian layout alt+m arrives as ESC + "ь". Map those back to the QWERTY key.
+const CYRILLIC = "йцукенгшщзхъфывапролджэячсмитьбюіїє";
+const QWERTY = "qwertyuiop[]asdfghjkl;'zxcvbnm,.s]'";
+const CYRILLIC_TO_QWERTY: Record<string, string> = Object.fromEntries([...CYRILLIC].map((c, i) => [c, QWERTY[i]]));
+// What macOS Terminal types for Option+key on the U.S. layout when "Use Option as Meta" is off.
+const MAC_OPTION_CHARS: Record<string, string> = { "µ": "alt+m" };
+
+function matchesShortcut(data: string, shortcut: string): boolean {
+	if (matchesKey(data, shortcut as KeyId)) return true;
+	if (MAC_OPTION_CHARS[data] === shortcut) return true;
+	if (data.length === 2 && data[0] === "\x1b") {
+		const latin = CYRILLIC_TO_QWERTY[data[1].toLowerCase()];
+		return latin !== undefined && matchesKey(`\x1b${latin}`, shortcut as KeyId);
+	}
+	return false;
+}
+
 function formatSeconds(seconds: number): string {
 	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
@@ -260,7 +278,7 @@ export default function (pi: ExtensionAPI) {
 	// The shortcut is read from raw input rather than registerShortcut: hold-to-talk needs key
 	// releases, which arrive only from terminals speaking the kitty keyboard protocol.
 	function onKey(data: string, ctx: ExtensionContext) {
-		if (!matchesKey(data, config.shortcut as KeyId)) return undefined;
+		if (!matchesShortcut(data, config.shortcut)) return undefined;
 		if (!isKittyProtocolActive()) {
 			void toggle(ctx);
 		} else if (isKeyRelease(data)) {

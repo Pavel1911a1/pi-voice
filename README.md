@@ -35,9 +35,10 @@ Hold-to-talk needs a terminal that reports key releases through the kitty keyboa
 Ghostty, kitty, WezTerm, Alacritty, foot, or iTerm2 with "Report keys using CSI u". macOS Terminal
 and Windows Terminal do not report releases, so there the shortcut works as press-and-pause.
 
-On macOS `alt` shortcuts need "Use Option as Meta key" in the terminal settings
-(Terminal: Profiles → Keyboard; iTerm2: Profiles → Keys → Left Option key → Esc+).
-Otherwise use `/voice` or pick another shortcut.
+On a Mac, `alt` is the Option (⌥) key. In macOS Terminal Option+M works out of the box on the U.S.
+layout. On Russian/Ukrainian layouts it types `~`, so turn on "Use Option as Meta key"
+(Terminal: Settings → Profiles → Keyboard; iTerm2: Profiles → Keys → Left Option key → Esc+);
+with it the shortcut works on any layout.
 
 ## Settings
 
