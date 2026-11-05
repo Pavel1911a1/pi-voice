@@ -7,11 +7,15 @@
  * Speech is transcribed locally with whisper.cpp and pasted into the editor; nothing leaves
  * the machine. The model is downloaded once on first use.
  *
+ * With speech output on (/voice-tts), finished replies are read aloud with local Piper voices:
+ * Irina for Russian, Amy for English. alt+s stops reading.
+ *
  * Settings live in ~/.pi/agent/voice.json, see README.md.
  */
 
 import { type ChildProcess, fork } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
@@ -20,6 +24,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, isKeyRepeat, isKittyProtocolActive, type KeyId, matchesKey } from "@earendil-works/pi-tui";
 import { PvRecorder } from "@picovoice/pvrecorder-node";
+import { type SpeechLanguage, type SpeechSegment, toSpeech } from "./speech-text.ts";
 
 type Language = "auto" | "ru" | "en";
 
@@ -36,6 +41,14 @@ interface VoiceConfig {
 	/** Without hold-to-talk, stop recording after this much silence following speech. */
 	autoStop: boolean;
 	silenceMs: number;
+	/** Read finished replies aloud. */
+	speak: boolean;
+	stopSpeechShortcut: string;
+	/** sherpa-onnx Piper voice packages, see https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models */
+	voices: Record<SpeechLanguage, string>;
+	speechRate: number;
+	/** Longer replies are cut at a sentence boundary with "the rest is on screen". */
+	maxSpeakChars: number;
 }
 
 const DEFAULTS: VoiceConfig = {
@@ -47,9 +60,15 @@ const DEFAULTS: VoiceConfig = {
 	maxSeconds: 300,
 	autoStop: true,
 	silenceMs: 1500,
+	speak: false,
+	stopSpeechShortcut: "alt+s",
+	voices: { ru: "vits-piper-ru_RU-irina-medium", en: "vits-piper-en_US-amy-medium" },
+	speechRate: 1,
+	maxSpeakChars: 1500,
 };
 
 const MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
+const VOICE_BASE_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/";
 const STATUS = "voice";
 const FRAME_LENGTH = 512;
 // Below this peak amplitude the recording is treated as silence: whisper invents text for it.
@@ -67,10 +86,22 @@ function loadConfig(): VoiceConfig {
 	const path = configPath();
 	if (!existsSync(path)) return { ...DEFAULTS };
 	try {
-		return { ...DEFAULTS, ...JSON.parse(readFileSync(path, "utf8")) };
+		const saved = JSON.parse(readFileSync(path, "utf8"));
+		return { ...DEFAULTS, ...saved, voices: { ...DEFAULTS.voices, ...saved.voices } };
 	} catch {
 		return { ...DEFAULTS };
 	}
+}
+
+/** Writes one setting into voice.json, keeping whatever else the user put there. */
+function saveSetting(key: keyof VoiceConfig, value: unknown): void {
+	const path = configPath();
+	let saved: Record<string, unknown> = {};
+	try {
+		saved = JSON.parse(readFileSync(path, "utf8"));
+	} catch {}
+	saved[key] = value;
+	writeFileSync(path, `${JSON.stringify(saved, null, 2)}\n`);
 }
 
 function modelPath(config: VoiceConfig): string {
@@ -107,6 +138,78 @@ async function downloadModel(config: VoiceConfig, ctx: ExtensionContext): Promis
 	}
 }
 
+interface VoiceFiles {
+	model: string;
+	tokens: string;
+	dataDir: string;
+}
+
+function voiceDir(name: string): string {
+	return join(getAgentDir(), "voice", "voices", name);
+}
+
+function voiceFiles(name: string): VoiceFiles | undefined {
+	const dir = voiceDir(name);
+	if (!existsSync(dir)) return undefined;
+	const model = readdirSync(dir).find((file) => file.endsWith(".onnx"));
+	if (!model) return undefined;
+	return { model: join(dir, model), tokens: join(dir, "tokens.txt"), dataDir: join(dir, "espeak-ng-data") };
+}
+
+/** Downloads a voice archive (.tar.bz2) and unpacks it with the system tar (macOS, Linux, Windows 10+). */
+async function downloadVoice(name: string, ctx: ExtensionContext): Promise<void> {
+	const target = voiceDir(name);
+	const part = `${target}.part`;
+	rmSync(part, { recursive: true, force: true });
+	mkdirSync(part, { recursive: true });
+	const response = await fetch(VOICE_BASE_URL + name + ".tar.bz2");
+	if (!response.ok || !response.body) throw new Error(`voice download failed: HTTP ${response.status} for ${name}`);
+	const total = Number(response.headers.get("content-length")) || 0;
+	let received = 0;
+	let shown = -1;
+	const body = Readable.fromWeb(response.body as any);
+	body.on("data", (chunk: Buffer) => {
+		received += chunk.length;
+		const percent = total ? Math.floor((received / total) * 100) : -1;
+		if (percent !== shown) {
+			shown = percent;
+			ctx.ui.setStatus(STATUS, `voice: downloading ${name.replace("vits-piper-", "")} ${percent >= 0 ? `${percent}%` : ""}`);
+		}
+	});
+	const tar = spawn("tar", ["-xjf", "-", "-C", part, "--strip-components", "1"], { stdio: ["pipe", "ignore", "pipe"] });
+	let tarError = "";
+	tar.stderr.on("data", (chunk) => (tarError += chunk));
+	const exited = new Promise<number | null>((resolve, reject) => {
+		tar.once("error", reject);
+		tar.once("exit", resolve);
+	});
+	try {
+		await pipeline(body, tar.stdin);
+		const code = await exited;
+		if (code !== 0) throw new Error(`tar failed (${code}): ${tarError.trim()}`);
+		rmSync(target, { recursive: true, force: true });
+		renameSync(part, target);
+	} catch (error) {
+		rmSync(part, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+/** Text of the last assistant message that has any: earlier ones are progress notes between tool calls. */
+function lastReplyText(messages: readonly any[]): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role !== "assistant") continue;
+		const text = Array.isArray(message.content)
+			? message.content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n")
+			: typeof message.content === "string"
+				? message.content
+				: "";
+		if (text.trim()) return text;
+	}
+	return undefined;
+}
+
 function rms(frame: Int16Array): number {
 	let sum = 0;
 	for (const s of frame) sum += s * s;
@@ -131,7 +234,9 @@ function matchesShortcut(data: string, shortcut: string): boolean {
 	return false;
 }
 
-const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "whisper-worker.mjs");
+const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+const WORKER_PATH = join(EXTENSION_DIR, "whisper-worker.mjs");
+const TTS_WORKER_PATH = join(EXTENSION_DIR, "tts-worker.mjs");
 
 /** whisper.cpp in a child process with stdio ignored, so its native logs never reach pi's screen. */
 class WhisperWorker {
@@ -184,6 +289,49 @@ class WhisperWorker {
 	}
 }
 
+/** Piper voices in a child process: synthesis is CPU-heavy and sherpa-onnx logs to stderr. */
+class Speaker {
+	private readonly child: ChildProcess;
+	private nextId = 1;
+	private current = 0;
+
+	constructor(private readonly onFinished: (error?: string) => void) {
+		this.child = fork(TTS_WORKER_PATH, [], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+		this.child.on("message", (message: any) => {
+			if (message.id !== this.current) return;
+			this.current = 0;
+			this.onFinished(message.type === "error" ? message.message : undefined);
+		});
+		this.child.on("exit", () => {
+			if (this.current) this.onFinished("speech worker exited");
+			this.current = 0;
+		});
+	}
+
+	get alive(): boolean {
+		return this.child.exitCode === null && this.child.connected;
+	}
+
+	get speaking(): boolean {
+		return this.current !== 0;
+	}
+
+	speak(segments: SpeechSegment[], voices: Record<SpeechLanguage, VoiceFiles>, speed: number): void {
+		this.current = this.nextId++;
+		this.child.send({ type: "speak", id: this.current, segments, voices, speed });
+	}
+
+	stop(): void {
+		if (!this.current) return;
+		this.current = 0;
+		this.child.send({ type: "stop" });
+	}
+
+	dispose(): void {
+		if (this.child.connected) this.child.disconnect();
+	}
+}
+
 function formatSeconds(seconds: number): string {
 	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
@@ -200,6 +348,44 @@ export default function (pi: ExtensionAPI) {
 	let recordingLoop: Promise<void> | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let unsubscribeInput: (() => void) | undefined;
+	let speaker: Speaker | undefined;
+	let lastReply: string | undefined;
+	let speechCtx: ExtensionContext | undefined;
+
+	function stopSpeaking(): void {
+		if (!speaker?.speaking) return;
+		speaker.stop();
+		speechCtx?.ui.setStatus(STATUS, undefined);
+	}
+
+	async function speakText(ctx: ExtensionContext, markdown: string): Promise<void> {
+		const segments = toSpeech(markdown, config.maxSpeakChars);
+		if (!segments.length) return;
+		speechCtx = ctx;
+		try {
+			const voices = {} as Record<SpeechLanguage, VoiceFiles>;
+			for (const lang of new Set(segments.map((s) => s.lang))) {
+				const name = config.voices[lang];
+				if (!voiceFiles(name)) {
+					ctx.ui.notify(`Downloading voice ${name} (one time, ~65 MB)...`, "info");
+					await downloadVoice(name, ctx);
+				}
+				voices[lang] = voiceFiles(name)!;
+			}
+			if (state !== "idle") return;
+			if (!speaker?.alive) {
+				speaker = new Speaker((error) => {
+					speechCtx?.ui.setStatus(STATUS, undefined);
+					if (error) speechCtx?.ui.notify(`Speech failed: ${error}`, "error");
+				});
+			}
+			ctx.ui.setStatus(STATUS, `🔊 speaking · ${config.stopSpeechShortcut} to stop`);
+			speaker.speak(segments, voices, config.speechRate);
+		} catch (error) {
+			ctx.ui.setStatus(STATUS, undefined);
+			ctx.ui.notify(`Speech unavailable: ${(error as Error).message}`, "error");
+		}
+	}
 
 	async function ensureWhisper(ctx: ExtensionContext): Promise<WhisperWorker> {
 		if (whisper?.alive) return whisper;
@@ -213,6 +399,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startRecording(ctx: ExtensionContext, hold: boolean): Promise<void> {
+		stopSpeaking();
 		state = "preparing";
 		holding = hold;
 		releasedWhilePreparing = false;
@@ -329,6 +516,10 @@ export default function (pi: ExtensionAPI) {
 	// The shortcut is read from raw input rather than registerShortcut: hold-to-talk needs key
 	// releases, which arrive only from terminals speaking the kitty keyboard protocol.
 	function onKey(data: string, ctx: ExtensionContext) {
+		if (speaker?.speaking && matchesShortcut(data, config.stopSpeechShortcut)) {
+			if (!isKeyRelease(data)) stopSpeaking();
+			return { consume: true };
+		}
 		if (!matchesShortcut(data, config.shortcut)) return undefined;
 		if (!isKittyProtocolActive()) {
 			void toggle(ctx);
@@ -345,6 +536,45 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		unsubscribeInput?.();
 		unsubscribeInput = ctx.ui.onTerminalInput((data) => onKey(data, ctx));
+	});
+
+	pi.on("agent_start", async () => stopSpeaking());
+
+	pi.on("agent_end", async (event) => {
+		lastReply = lastReplyText(event.messages) ?? lastReply;
+	});
+
+	pi.on("agent_settled", async (event, ctx) => {
+		if (config.speak && !event.aborted && lastReply) void speakText(ctx, lastReply);
+	});
+
+	pi.registerCommand("voice-tts", {
+		description: "Read finished replies aloud: on, off, or no argument to toggle",
+		handler: async (args, ctx) => {
+			const arg = args.trim().toLowerCase();
+			if (arg && arg !== "on" && arg !== "off") {
+				ctx.ui.notify("Usage: /voice-tts on|off", "info");
+				return;
+			}
+			config.speak = arg ? arg === "on" : !config.speak;
+			saveSetting("speak", config.speak);
+			if (!config.speak) stopSpeaking();
+			ctx.ui.notify(
+				config.speak ? `Replies will be read aloud. ${config.stopSpeechShortcut} stops reading.` : "Replies will not be read aloud.",
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("voice-say", {
+		description: "Read the last reply aloud",
+		handler: async (_args, ctx) => {
+			if (!lastReply) {
+				ctx.ui.notify("No reply to read yet.", "info");
+				return;
+			}
+			await speakText(ctx, lastReply);
+		},
 	});
 
 	pi.registerCommand("voice", {
@@ -384,5 +614,7 @@ export default function (pi: ExtensionAPI) {
 		recorder = undefined;
 		whisper?.stop();
 		whisper = undefined;
+		speaker?.dispose();
+		speaker = undefined;
 	});
 }

@@ -1,14 +1,15 @@
 {
   "name": "pi-voice",
-  "version": "0.1.0",
-  "description": "Offline voice input for the pi coding agent: press a key, speak Russian or English, get text in the editor.",
+  "version": "0.2.0",
+  "description": "Offline voice input and spoken replies (Russian/English) for the pi coding agent.",
   "license": "MIT",
   "type": "module",
   "keywords": [
     "pi-package",
     "voice",
     "speech-to-text",
-    "whisper"
+    "whisper",
+    "text-to-speech"
   ],
   "pi": {
     "extensions": [
@@ -17,7 +18,8 @@
   },
   "dependencies": {
     "@fugood/whisper.node": "1.1.3",
-    "@picovoice/pvrecorder-node": "1.2.9"
+    "@picovoice/pvrecorder-node": "1.2.9",
+    "sherpa-onnx-node": "1.13.8"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

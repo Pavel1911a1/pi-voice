@@ -1,12 +1,14 @@
 # pi-voice
 
-Offline voice input for the [pi](https://pi.dev) coding agent. Press a key, speak Russian or English,
-pause — the text appears in pi's editor for you to review and send.
+Offline voice input and spoken replies for the [pi](https://pi.dev) coding agent. Press a key, speak
+Russian or English, pause — the text appears in pi's editor for you to review and send. Optionally,
+pi reads its finished replies back to you.
 
 - **Private.** Audio never leaves your machine: it is captured with
   [PvRecorder](https://github.com/Picovoice/pvrecorder) and transcribed locally by
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp) via [whisper.node](https://github.com/mybigday/whisper.node).
-  No accounts, API keys or cloud.
+  Replies are read by [Piper](https://github.com/rhasspy/piper) voices through
+  [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). No accounts, API keys or cloud.
 - **Russian and English**, detected automatically per recording.
 - **No system packages.** No brew, apt, choco or compilers: npm installs prebuilt binaries for your OS and CPU.
 
@@ -27,7 +29,7 @@ Update with `pi update --extensions`, remove with `pi remove git:github.com/Pave
 | OS | CPU | Notes |
 |---|---|---|
 | macOS | Apple Silicon, Intel | Apple Silicon uses the GPU (Metal); a 10 s phrase takes ~1.5 s |
-| Windows | x64, arm64 | |
+| Windows | x64, arm64 | Spoken replies: x64 only |
 | Linux | x64 | arm64 is not supported by the recorder (except Raspberry Pi builds) |
 
 Developed and tested on macOS. Windows and Linux use the upstream prebuilt binaries and are
@@ -42,6 +44,9 @@ expected to work; reports welcome.
 | Stop early | press the shortcut again |
 | Language for this session | `/voice-lang auto`, `/voice-lang ru`, `/voice-lang en` |
 | List microphones | `/voice-devices` |
+| Read replies aloud on / off | `/voice-tts on`, `/voice-tts off` (remembered between sessions) |
+| Read the last reply again | `/voice-say` |
+| Stop reading | `alt+s`, start a voice recording, or send a new message |
 
 While recording the status bar shows `● REC 0:05`; while transcribing, `voice: transcribing...`.
 
@@ -53,6 +58,21 @@ While recording the status bar shows `● REC 0:05`; while transcribing, `voice:
   Alacritty, foot.
 - **Press and pause** everywhere else (macOS Terminal, Windows Terminal, GNOME Terminal, Konsole,
   VS Code / JetBrains terminals...): press once, speak, and recording stops by itself when you pause.
+
+## Spoken replies
+
+Turn on with `/voice-tts on`. When pi has completely finished a reply (not between tool calls),
+pi-voice reads it aloud:
+
+- Russian sentences with the **Irina** voice, English ones with **Amy**, switching per sentence.
+- Code blocks, tables, file paths, URLs and Markdown markup are skipped; only the prose is read.
+- Long replies are cut after about 1500 characters (roughly a minute and a half) at a sentence
+  boundary, followed by "the rest is on screen".
+- Replies you interrupted with Escape are not read.
+
+The two voices (~65 MB each) are downloaded on first use into `~/.pi/agent/voice/voices/` and
+unpacked with the system `tar`. Audio plays through the OS player: `afplay` on macOS, PowerShell on
+Windows, `paplay` / `pw-play` / `aplay` on Linux.
 
 ## Setting up the shortcut
 
@@ -99,7 +119,10 @@ Pick a combination your terminal can send and pi does not already use. Most `ctr
 combinations are taken by pi, and classic terminals cannot tell `ctrl+shift+m` from `ctrl+m`
 (which is Enter). Alt+letter or a function key is the safest choice.
 
-The shortcut also works on Russian and Ukrainian keyboard layouts: Alt+Ь counts as Alt+M.
+The same applies to `stopSpeechShortcut` (default `alt+s`), which works only while a reply is being
+read and otherwise passes through to pi.
+
+Shortcuts also work on Russian and Ukrainian keyboard layouts: Alt+Ь counts as Alt+M.
 
 ## Settings
 
@@ -113,7 +136,12 @@ All optional, in `~/.pi/agent/voice.json`:
   "autoStop": true,
   "silenceMs": 1500,
   "device": -1,
-  "maxSeconds": 300
+  "maxSeconds": 300,
+  "speak": false,
+  "stopSpeechShortcut": "alt+s",
+  "voices": { "ru": "vits-piper-ru_RU-irina-medium", "en": "vits-piper-en_US-amy-medium" },
+  "speechRate": 1,
+  "maxSpeakChars": 1500
 }
 ```
 
@@ -128,6 +156,11 @@ All optional, in `~/.pi/agent/voice.json`:
 | `maxSeconds` | `300` | Hard limit for one recording |
 | `model` | `ggml-large-v3-turbo-q5_0.bin` | Any ggml whisper model from [whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp); smaller models are faster but much weaker in Russian |
 | `modelUrl` | Hugging Face | Where to download `model` from, e.g. an internal mirror |
+| `speak` | `false` | Read finished replies aloud; `/voice-tts` changes it |
+| `stopSpeechShortcut` | `alt+s` | Key that stops reading |
+| `voices` | Irina, Amy | Any `vits-piper-*` voice from the [sherpa-onnx voice list](https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models), e.g. `vits-piper-ru_RU-denis-medium`, `vits-piper-en_US-ryan-medium` |
+| `speechRate` | `1` | Speaking speed: `1.2` is faster, `0.8` slower |
+| `maxSpeakChars` | `1500` | How much of a long reply to read |
 
 Changes apply after `/reload` or restarting pi.
 
@@ -139,6 +172,8 @@ Changes apply after `/reload` or restarting pi.
   selected: check `/voice-devices` and the OS microphone permission.
 - **Words come out wrong** — add them to `vocabulary`; set `language` if your speech is mostly one language.
 - **Cut off mid-sentence** — raise `silenceMs`, or use a terminal with hold-to-talk.
+- **No sound from spoken replies** — check the output device and volume; on Linux make sure one of
+  `paplay`, `pw-play` or `aplay` is installed.
 - **Model download fails** behind a proxy or firewall — download the model file yourself into
   `~/.pi/agent/voice/models/`, or point `modelUrl` to a reachable copy.
 
@@ -149,7 +184,12 @@ and detects the end of speech by loudness. Transcription runs in a child process
 (`extensions/whisper-worker.mjs`) that keeps the model loaded between recordings; running it
 separately keeps whisper.cpp's native logs off pi's screen and pi responsive while it works.
 
+Spoken replies: `extensions/speech-text.ts` turns the reply's Markdown into sentences tagged with a
+language, and `extensions/tts-worker.mjs`, another child process, synthesizes them with Piper and
+plays them, preparing the next piece while the current one plays.
+
 ## License
 
-MIT. The speech model is distributed by the whisper.cpp project under the MIT license; PvRecorder
-is Apache-2.0.
+MIT. The speech recognition model is distributed by the whisper.cpp project under the MIT license;
+PvRecorder and sherpa-onnx are Apache-2.0. Piper voices carry their own licenses, listed in each
+voice's `MODEL_CARD`.
