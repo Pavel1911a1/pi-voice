@@ -10,13 +10,14 @@
  * Settings live in ~/.pi/agent/voice.json, see README.md.
  */
 
+import { type ChildProcess, fork } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { initWhisper, type WhisperContext } from "@fugood/whisper.node";
 import { isKeyRelease, isKeyRepeat, isKittyProtocolActive, type KeyId, matchesKey } from "@earendil-works/pi-tui";
 import { PvRecorder } from "@picovoice/pvrecorder-node";
 
@@ -130,6 +131,59 @@ function matchesShortcut(data: string, shortcut: string): boolean {
 	return false;
 }
 
+const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "whisper-worker.mjs");
+
+/** whisper.cpp in a child process with stdio ignored, so its native logs never reach pi's screen. */
+class WhisperWorker {
+	private readonly pending = new Map<number, { resolve: (text: string) => void; reject: (error: Error) => void }>();
+	private nextId = 1;
+
+	private constructor(private readonly child: ChildProcess) {
+		child.on("message", (message: any) => {
+			const waiter = this.pending.get(message.id);
+			if (!waiter) return;
+			this.pending.delete(message.id);
+			if (message.type === "result") waiter.resolve(message.text);
+			else waiter.reject(new Error(message.message));
+		});
+		child.on("exit", (code) => {
+			for (const waiter of this.pending.values()) waiter.reject(new Error(`speech worker exited (${code})`));
+			this.pending.clear();
+		});
+	}
+
+	static start(model: string): Promise<WhisperWorker> {
+		const child = fork(WORKER_PATH, [], { stdio: ["ignore", "ignore", "ignore", "ipc"], serialization: "advanced" });
+		return new Promise((resolve, reject) => {
+			child.once("message", (message: any) => {
+				if (message.type === "ready") resolve(new WhisperWorker(child));
+				else {
+					child.kill();
+					reject(new Error(message.message));
+				}
+			});
+			child.once("exit", (code) => reject(new Error(`speech worker exited (${code}) while loading the model`)));
+			child.send({ type: "init", model });
+		});
+	}
+
+	get alive(): boolean {
+		return this.child.exitCode === null && this.child.connected;
+	}
+
+	transcribe(pcm: Int16Array, language: string, prompt: string | undefined): Promise<string> {
+		const id = this.nextId++;
+		return new Promise((resolve, reject) => {
+			this.pending.set(id, { resolve, reject });
+			this.child.send({ type: "transcribe", id, pcm, language, prompt });
+		});
+	}
+
+	stop(): void {
+		if (this.child.connected) this.child.disconnect();
+	}
+}
+
 function formatSeconds(seconds: number): string {
 	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
@@ -140,21 +194,21 @@ export default function (pi: ExtensionAPI) {
 	// Hold mode: started by a key press in a terminal that reports key releases; stops on release.
 	let holding = false;
 	let releasedWhilePreparing = false;
-	let whisper: WhisperContext | undefined;
+	let whisper: WhisperWorker | undefined;
 	let recorder: PvRecorder | undefined;
 	let frames: Int16Array[] = [];
 	let recordingLoop: Promise<void> | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let unsubscribeInput: (() => void) | undefined;
 
-	async function ensureWhisper(ctx: ExtensionContext): Promise<WhisperContext> {
-		if (whisper) return whisper;
+	async function ensureWhisper(ctx: ExtensionContext): Promise<WhisperWorker> {
+		if (whisper?.alive) return whisper;
 		if (!existsSync(modelPath(config))) {
 			ctx.ui.notify(`Downloading speech model ${config.model} (one time, ~550 MB)...`, "info");
 			await downloadModel(config, ctx);
 		}
 		ctx.ui.setStatus(STATUS, "voice: loading model");
-		whisper = await initWhisper({ filePath: modelPath(config), useGpu: true });
+		whisper = await WhisperWorker.start(modelPath(config));
 		return whisper;
 	}
 
@@ -252,12 +306,9 @@ export default function (pi: ExtensionAPI) {
 
 		ctx.ui.setStatus(STATUS, "voice: transcribing...");
 		try {
-			const context = await ensureWhisper(ctx);
-			const { promise } = context.transcribeData(samples.buffer, {
-				language: config.language,
-				prompt: config.vocabulary.length ? config.vocabulary.join(", ") + "." : undefined,
-			});
-			const text = (await promise).result.trim();
+			const worker = await ensureWhisper(ctx);
+			const prompt = config.vocabulary.length ? config.vocabulary.join(", ") + "." : undefined;
+			const text = await worker.transcribe(samples, config.language, prompt);
 			if (text) {
 				const current = ctx.ui.getEditorText();
 				ctx.ui.pasteToEditor(current && !/\s$/.test(current) ? ` ${text}` : text);
@@ -331,7 +382,7 @@ export default function (pi: ExtensionAPI) {
 		recorder?.stop();
 		recorder?.release();
 		recorder = undefined;
-		await whisper?.release();
+		whisper?.stop();
 		whisper = undefined;
 	});
 }
