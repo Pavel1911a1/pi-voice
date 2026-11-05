@@ -1,6 +1,6 @@
 {
   "name": "pi-voice",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Offline voice input and spoken replies (Russian/English) for the pi coding agent.",
   "license": "MIT",
   "type": "module",

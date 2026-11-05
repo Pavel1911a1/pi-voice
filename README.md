@@ -69,6 +69,9 @@ pi-voice reads it aloud:
 - Long replies are cut after about 1500 characters (roughly a minute and a half) at a sentence
   boundary, followed by "the rest is on screen".
 - Replies you interrupted with Escape are not read.
+- Only one pi speaks at a time. Other pi processes count too: other terminals and side agents such as
+  [pi-watcher](https://github.com/gee666/pi-watcher), whose replies are read as well. `alt+s` or a
+  new voice recording in any pi window stops whichever one is speaking.
 
 The two voices (~65 MB each) are downloaded on first use into `~/.pi/agent/voice/voices/` and
 unpacked with the system `tar`. Audio plays through the OS player: `afplay` on macOS, PowerShell on
@@ -83,8 +86,8 @@ The default shortcut is `alt+m`. Terminals deliver Alt (Option on a Mac) differe
 On a Mac, `alt` is the **Option (⌥)** key.
 
 - **Terminal.app** — Settings → Profiles → *your profile* → Keyboard → enable
-  **Use Option as Meta key**. Without it Option+M still works on the U.S. layout, but on Russian or
-  Ukrainian layouts Option+M types `~` and cannot be used as a shortcut.
+  **Use Option as Meta key**. Without it Option+letter shortcuts still work on the U.S. layout, but on
+  Russian or Ukrainian layouts Option+M types `~` and cannot be used as a shortcut.
 - **iTerm2** — Settings → Profiles → Keys → General → set **Left Option key** to **Esc+**.
 - **Ghostty** (hold to talk) — add `macos-option-as-alt = true` to `~/.config/ghostty/config`.
 - **kitty** (hold to talk) — add `macos_option_as_alt yes` to `~/.config/kitty/kitty.conf`.
@@ -119,8 +122,7 @@ Pick a combination your terminal can send and pi does not already use. Most `ctr
 combinations are taken by pi, and classic terminals cannot tell `ctrl+shift+m` from `ctrl+m`
 (which is Enter). Alt+letter or a function key is the safest choice.
 
-The same applies to `stopSpeechShortcut` (default `alt+s`), which works only while a reply is being
-read and otherwise passes through to pi.
+The same applies to `stopSpeechShortcut` (default `alt+s`).
 
 Shortcuts also work on Russian and Ukrainian keyboard layouts: Alt+Ь counts as Alt+M.
 

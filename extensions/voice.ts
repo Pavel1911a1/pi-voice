@@ -15,8 +15,19 @@
 
 import { type ChildProcess, fork } from "node:child_process";
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+	createWriteStream,
+	existsSync,
+	type FSWatcher,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	watch,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -70,6 +81,7 @@ const DEFAULTS: VoiceConfig = {
 const MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 const VOICE_BASE_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/";
 const STATUS = "voice";
+const STOP_SIGNAL = join(getAgentDir(), "voice", "stop-speech");
 const FRAME_LENGTH = 512;
 // Below this peak amplitude the recording is treated as silence: whisper invents text for it.
 const SILENCE_PEAK = 500;
@@ -221,8 +233,13 @@ function rms(frame: Int16Array): number {
 const CYRILLIC = "йцукенгшщзхъфывапролджэячсмитьбюіїє";
 const QWERTY = "qwertyuiop[]asdfghjkl;'zxcvbnm,.s]'";
 const CYRILLIC_TO_QWERTY: Record<string, string> = Object.fromEntries([...CYRILLIC].map((c, i) => [c, QWERTY[i]]));
-// What macOS Terminal types for Option+key on the U.S. layout when "Use Option as Meta" is off.
-const MAC_OPTION_CHARS: Record<string, string> = { "µ": "alt+m" };
+// What macOS Terminal types for Option+letter on the U.S. layout when "Use Option as Meta" is off
+// (e, i, n and u are dead keys there and type nothing on their own).
+const MAC_OPTION_LETTERS = "abcdfghjklmopqrstvwxyz";
+const MAC_OPTION_TYPED = "å∫ç∂ƒ©˙∆˚¬µøπœ®ß†√∑≈¥Ω";
+const MAC_OPTION_CHARS: Record<string, string> = Object.fromEntries(
+	[...MAC_OPTION_TYPED].map((c, i) => [c, `alt+${MAC_OPTION_LETTERS[i]}`]),
+);
 
 function matchesShortcut(data: string, shortcut: string): boolean {
 	if (matchesKey(data, shortcut as KeyId)) return true;
@@ -351,11 +368,35 @@ export default function (pi: ExtensionAPI) {
 	let speaker: Speaker | undefined;
 	let lastReply: string | undefined;
 	let speechCtx: ExtensionContext | undefined;
+	let stopWatcher: FSWatcher | undefined;
 
 	function stopSpeaking(): void {
 		if (!speaker?.speaking) return;
 		speaker.stop();
 		speechCtx?.ui.setStatus(STATUS, undefined);
+	}
+
+	// Other pi processes speak too (other terminals, the pi-watcher side agent). A stop key or a
+	// new recording anywhere silences all of them, and a new reply silences the previous one.
+	function stopSpeakingEverywhere(): void {
+		stopSpeaking();
+		try {
+			mkdirSync(dirname(STOP_SIGNAL), { recursive: true });
+			writeFileSync(STOP_SIGNAL, `${process.pid} ${Date.now()}`);
+		} catch {}
+	}
+
+	function watchStopSignal(): void {
+		stopWatcher?.close();
+		try {
+			mkdirSync(dirname(STOP_SIGNAL), { recursive: true });
+			stopWatcher = watch(dirname(STOP_SIGNAL), (_event, file) => {
+				if (file !== basename(STOP_SIGNAL)) return;
+				try {
+					if (readFileSync(STOP_SIGNAL, "utf8").split(" ")[0] !== String(process.pid)) stopSpeaking();
+				} catch {}
+			});
+		} catch {}
 	}
 
 	async function speakText(ctx: ExtensionContext, markdown: string): Promise<void> {
@@ -379,6 +420,7 @@ export default function (pi: ExtensionAPI) {
 					if (error) speechCtx?.ui.notify(`Speech failed: ${error}`, "error");
 				});
 			}
+			stopSpeakingEverywhere();
 			ctx.ui.setStatus(STATUS, `🔊 speaking · ${config.stopSpeechShortcut} to stop`);
 			speaker.speak(segments, voices, config.speechRate);
 		} catch (error) {
@@ -399,7 +441,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startRecording(ctx: ExtensionContext, hold: boolean): Promise<void> {
-		stopSpeaking();
+		stopSpeakingEverywhere();
 		state = "preparing";
 		holding = hold;
 		releasedWhilePreparing = false;
@@ -516,8 +558,9 @@ export default function (pi: ExtensionAPI) {
 	// The shortcut is read from raw input rather than registerShortcut: hold-to-talk needs key
 	// releases, which arrive only from terminals speaking the kitty keyboard protocol.
 	function onKey(data: string, ctx: ExtensionContext) {
-		if (speaker?.speaking && matchesShortcut(data, config.stopSpeechShortcut)) {
-			if (!isKeyRelease(data)) stopSpeaking();
+		if (matchesShortcut(data, config.stopSpeechShortcut)) {
+			// Always handled here: the voice may be playing in another pi process.
+			if (!isKeyRelease(data)) stopSpeakingEverywhere();
 			return { consume: true };
 		}
 		if (!matchesShortcut(data, config.shortcut)) return undefined;
@@ -536,6 +579,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		unsubscribeInput?.();
 		unsubscribeInput = ctx.ui.onTerminalInput((data) => onKey(data, ctx));
+		watchStopSignal();
 	});
 
 	pi.on("agent_start", async () => stopSpeaking());
@@ -545,6 +589,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
+		// Re-read: /voice-tts may have been toggled in another pi process (e.g. the main one while
+		// this is the pi-watcher side agent, which was started earlier and lives on).
+		config.speak = loadConfig().speak;
 		if (config.speak && !event.aborted && lastReply) void speakText(ctx, lastReply);
 	});
 
@@ -616,5 +663,7 @@ export default function (pi: ExtensionAPI) {
 		whisper = undefined;
 		speaker?.dispose();
 		speaker = undefined;
+		stopWatcher?.close();
+		stopWatcher = undefined;
 	});
 }
