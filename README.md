@@ -1,7 +1,7 @@
 # pi-voice
 
 Offline voice input for the [pi](https://pi.dev) coding agent. Press a key, speak Russian or English,
-press it again — the text lands in the editor for you to review and send.
+pause — the text lands in the editor for you to review and send.
 
 Everything runs on your machine: audio is captured with [PvRecorder](https://github.com/Picovoice/pvrecorder)
 and transcribed by [whisper.cpp](https://github.com/ggml-org/whisper.cpp) through
@@ -25,9 +25,15 @@ On first recording the OS asks for microphone access for your **terminal app**
 
 | Action | How |
 |---|---|
-| Start / stop recording | `alt+m` or `/voice` |
+| Talk | press `alt+m` (or run `/voice`) and speak; recording stops after a 1.5 s pause |
+| Hold to talk | hold `alt+m` while speaking, let go to stop (terminals with key release events, see below) |
+| Stop early | press `alt+m` again |
 | Switch language for this session | `/voice-lang auto`, `/voice-lang ru`, `/voice-lang en` |
 | List microphones | `/voice-devices` |
+
+Hold-to-talk needs a terminal that reports key releases through the kitty keyboard protocol:
+Ghostty, kitty, WezTerm, Alacritty, foot, or iTerm2 with "Report keys using CSI u". macOS Terminal
+and Windows Terminal do not report releases, so there the shortcut works as press-and-pause.
 
 On macOS `alt` shortcuts need "Use Option as Meta key" in the terminal settings
 (Terminal: Profiles → Keyboard; iTerm2: Profiles → Keys → Left Option key → Esc+).
@@ -43,12 +49,16 @@ Optional `~/.pi/agent/voice.json`:
   "language": "auto",
   "vocabulary": ["Neo4j", "COBOL", "Jira", "pull request"],
   "device": -1,
-  "maxSeconds": 300
+  "maxSeconds": 300,
+  "autoStop": true,
+  "silenceMs": 1500
 }
 ```
 
 - `language`: `auto` detects per recording; fix it to `ru` or `en` if detection guesses wrong.
 - `vocabulary`: product names and identifiers whisper tends to mishear; they are passed as a hint.
+- `autoStop` / `silenceMs`: stop after this much silence; raise `silenceMs` if you pause mid-sentence,
+  or set `autoStop` to `false` to always stop with a second press.
 - `device`: index from `/voice-devices`, `-1` for the system default.
 - `model` / `modelUrl`: another ggml whisper model, e.g. `ggml-small.bin` for slow machines
   (much weaker in Russian).
