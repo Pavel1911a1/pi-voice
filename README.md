@@ -10,7 +10,7 @@ and transcribed by [whisper.cpp](https://github.com/ggml-org/whisper.cpp) throug
 ## Install
 
 ```bash
-pi install git:<repo-url>
+pi install git:github.com/Pavel1911a1/pi-voice
 ```
 
 No brew, apt or compilers needed: npm picks prebuilt binaries for your OS and CPU
